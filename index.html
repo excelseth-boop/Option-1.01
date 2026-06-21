@@ -404,6 +404,40 @@ label.lbl {
 .pos { color: var(--green); }
 .neg { color: var(--red); }
 
+/* ── POSITION BOOK ── */
+.posbook-wrap { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; width: 100%; }
+.pos-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px; width: 100%; overflow: hidden;
+}
+.pos-card.long  { border-left: 3px solid var(--green); }
+.pos-card.short { border-left: 3px solid var(--red); }
+.pos-card.flat  { border-left: 3px solid var(--text3); opacity: .6; }
+.pos-hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pos-sym { font-size: 16px; font-weight: 700; font-family: var(--mono); color: var(--text); flex-shrink: 0; }
+.pos-meta { font-size: 13px; color: var(--text2); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pos-badge {
+  font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 20px; flex-shrink: 0;
+}
+.pos-badge.long  { background: rgba(16,185,129,.2); color: var(--green); }
+.pos-badge.short { background: rgba(239,68,68,.2);  color: var(--red); }
+.pos-badge.flat  { background: rgba(100,116,139,.2); color: var(--text3); }
+.pos-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 8px;
+}
+.pos-stat { text-align: center; }
+.pos-stat-lbl { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 2px; }
+.pos-stat-val { font-size: 16px; font-weight: 700; font-family: var(--mono); }
+.pos-trades { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(45,63,94,.5); }
+.pos-trade-row {
+  display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 13px;
+}
+.pos-trade-side { font-weight: 700; width: 36px; flex-shrink: 0; }
+.pos-trade-side.buy  { color: var(--blue); }
+.pos-trade-side.sell { color: var(--amber); }
+.pos-trade-detail { flex: 1; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pos-trade-date { font-size: 11px; color: var(--text3); flex-shrink: 0; }
+
 /* ── SAVED ── */
 .svlist { display: flex; flex-direction: column; gap: 8px; width: 100%; }
 .svcard {
@@ -631,6 +665,11 @@ label.lbl {
 
   <!-- ══ PORTFOLIO ══ -->
   <div class="tab" id="tabPortfolio">
+    <div class="sec-title">Open Positions (Net Holdings)</div>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:10px;">Tracks net long/short quantity per Symbol + Strike + Expiry + Type across all saved trades — like a brokerage position book.</p>
+    <div id="posBookWrap"></div>
+    <div class="divider"></div>
+
     <div class="sec-title">Combine Strategies</div>
     <p style="font-size:13px;color:var(--text2);margin-bottom:10px;">Select saved strategies to calculate their combined P&amp;L.</p>
     <div class="pflist" id="pfList"></div>
@@ -1497,6 +1536,7 @@ function init() {
   }
   renderLegs();
   renderSaved();
+  renderPositionBook();
   updateMkt();
   setInterval(updateMkt, 60000);
 
@@ -1515,7 +1555,7 @@ function switchTab(tab) {
   document.getElementById('nav-'+tab.toLowerCase()).classList.add('on');
   document.getElementById('mainArea').scrollTop = 0;
   if (tab === 'Saved') renderSaved();
-  if (tab === 'Portfolio') renderPortfolio();
+  if (tab === 'Portfolio') { renderPortfolio(); renderPositionBook(); }
 }
 
 // ─── Lot size helper ──────────────────────────────────────────────────────────
@@ -1974,6 +2014,7 @@ function saveStrategy() {
   try { localStorage.setItem('sc3_strats', JSON.stringify(saved)); } catch(e){}
   showToast('Saved: ' + name);
   renderSaved();
+  renderPositionBook();
 }
 
 function renderSaved() {
@@ -2050,6 +2091,7 @@ function deleteStrategy(id) {
   try { localStorage.setItem('sc3_strats', JSON.stringify(saved)); } catch(e){}
   renderSaved();
   renderPortfolio();
+  renderPositionBook();
   showToast('Deleted');
 }
 
@@ -2059,10 +2101,158 @@ function clearAllSaved() {
   try { localStorage.setItem('sc3_strats', '[]'); } catch(e){}
   renderSaved();
   renderPortfolio();
+  renderPositionBook();
   showToast('All cleared');
 }
 
 // ─── Portfolio ────────────────────────────────────────────────────────────────
+// ─── POSITION BOOK — net open positions across all saved trades ──────────────
+// Groups every leg from every saved strategy by (symbol, strike, expiry-month, optionType)
+// and nets buy quantity vs sell quantity, exactly like a brokerage position book.
+// Example: Buy 2 ONGC 250 CE @6, then Sell 1 ONGC 250 CE @7 → Net Long 1 @ avg cost 6.
+
+function buildPositionKey(symbol, strike, lotMonth, otype) {
+  // Unique key per contract series: Symbol + Strike + Expiry-Month + Option-Type
+  return symbol + '|' + (strike != null ? strike : 'NA') + '|' + lotMonth + '|' + otype;
+}
+
+function computePositionBook() {
+  // bookMap: key -> { symbol, strike, lotMonth, otype, trades:[...], buyQty, sellQty, buyValue, sellValue }
+  var bookMap = {};
+
+  saved.forEach(function(strat) {
+    var symbol   = strat.symbol || strat.ticker || 'UNKNOWN';
+    var lotMonth = (strat.lotMonth !== undefined && strat.lotMonth !== null) ? strat.lotMonth : 0;
+    var lot      = strat.lot || 1;
+    var tradeDate = strat.date || '';
+
+    (strat.legs || []).forEach(function(leg) {
+      var cfg = CFG[leg.type];
+      if (!cfg) return;
+      // Only option legs (call/put) are tracked by strike+expiry series.
+      // Futures/Stock legs are tracked too, using strike=null (whole-symbol position).
+      var strike = cfg.hasK ? leg.strike : null;
+      var otype  = cfg.otype; // 'call' | 'put' | 'future' | 'stock'
+      var key = buildPositionKey(symbol, strike, lotMonth, otype);
+
+      if (!bookMap[key]) {
+        bookMap[key] = {
+          symbol: symbol, strike: strike, lotMonth: lotMonth, otype: otype, lot: lot,
+          trades: [], buyQty: 0, sellQty: 0, buyValue: 0, sellValue: 0
+        };
+      }
+      var entry = bookMap[key];
+      var qty   = leg.qty || 1;
+      var price = cfg.hasK ? (leg.premium || 0) : (leg.entryPrice || 0);
+      var isBuy = cfg.sign === 1; // Long = Buy, Short = Sell
+
+      entry.trades.push({
+        side: isBuy ? 'BUY' : 'SELL',
+        qty: qty, price: price, date: tradeDate, stratName: strat.name
+      });
+
+      if (isBuy) {
+        entry.buyQty   += qty;
+        entry.buyValue += qty * price;
+      } else {
+        entry.sellQty   += qty;
+        entry.sellValue += qty * price;
+      }
+    });
+  });
+
+  // Compute net position + weighted average cost for the OPEN side
+  var positions = Object.keys(bookMap).map(function(key) {
+    var e = bookMap[key];
+    var netQty = e.buyQty - e.sellQty; // >0 = net long, <0 = net short, 0 = flat/closed
+    var avgPrice = 0;
+    if (netQty > 0) {
+      // Net long: average cost basis from buy trades (simplified weighted avg of all buys,
+      // proportionally reduced by sells using FIFO-equivalent average-cost method)
+      avgPrice = e.buyQty > 0 ? (e.buyValue / e.buyQty) : 0;
+    } else if (netQty < 0) {
+      avgPrice = e.sellQty > 0 ? (e.sellValue / e.sellQty) : 0;
+    } else {
+      // Flat — show blended avg for reference
+      avgPrice = (e.buyQty + e.sellQty) > 0 ? ((e.buyValue + e.sellValue) / (e.buyQty + e.sellQty)) : 0;
+    }
+    return {
+      key: key, symbol: e.symbol, strike: e.strike, lotMonth: e.lotMonth, otype: e.otype, lot: e.lot,
+      buyQty: e.buyQty, sellQty: e.sellQty, netQty: netQty, avgPrice: avgPrice, trades: e.trades
+    };
+  });
+
+  // Sort: open positions first (by abs netQty desc), then flat/closed
+  positions.sort(function(a, b) {
+    var aOpen = a.netQty !== 0, bOpen = b.netQty !== 0;
+    if (aOpen !== bOpen) return aOpen ? -1 : 1;
+    return Math.abs(b.netQty) - Math.abs(a.netQty);
+  });
+
+  return positions;
+}
+
+function renderPositionBook() {
+  var wrap = document.getElementById('posBookWrap');
+  if (!wrap) return;
+
+  if (saved.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="ei">\uD83D\uDCD2</div><div class="et">No trades recorded yet</div><div class="es">Save strategies in Builder to build your position book</div></div>';
+    return;
+  }
+
+  var positions = computePositionBook();
+  if (positions.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="ei">\uD83D\uDCD2</div><div class="et">No tracked positions</div><div class="es">Add option/future/stock legs and save</div></div>';
+    return;
+  }
+
+  var EXPIRY_LABELS = ['Jun 2026', 'Jul 2026', 'Aug 2026'];
+  var html = '<div class="posbook-wrap">';
+
+  positions.forEach(function(p) {
+    var statusClass = p.netQty > 0 ? 'long' : p.netQty < 0 ? 'short' : 'flat';
+    var statusLabel = p.netQty > 0 ? 'NET LONG' : p.netQty < 0 ? 'NET SHORT' : 'CLOSED / FLAT';
+    var otypeLabel  = p.otype === 'call' ? 'CE' : p.otype === 'put' ? 'PE' : p.otype === 'future' ? 'FUT' : 'EQ';
+    var strikeLabel = p.strike != null ? (' ' + p.strike + ' ' + otypeLabel) : (' ' + otypeLabel);
+    var expiryLabel = EXPIRY_LABELS[p.lotMonth] || ('Month ' + p.lotMonth);
+
+    html += '<div class="pos-card ' + statusClass + '">'
+      + '<div class="pos-hdr">'
+      + '<span class="pos-sym">' + p.symbol + strikeLabel + '</span>'
+      + '<span class="pos-meta">' + expiryLabel + '</span>'
+      + '<span class="pos-badge ' + statusClass + '">' + statusLabel + '</span>'
+      + '</div>'
+      + '<div class="pos-grid">'
+      + '<div class="pos-stat"><div class="pos-stat-lbl">Bought</div><div class="pos-stat-val" style="color:var(--blue);">' + p.buyQty + '</div></div>'
+      + '<div class="pos-stat"><div class="pos-stat-lbl">Sold</div><div class="pos-stat-val" style="color:var(--amber);">' + p.sellQty + '</div></div>'
+      + '<div class="pos-stat"><div class="pos-stat-lbl">Net Open</div><div class="pos-stat-val" style="color:' + (p.netQty > 0 ? 'var(--green)' : p.netQty < 0 ? 'var(--red)' : 'var(--text3)') + ';">' + (p.netQty > 0 ? '+' : '') + p.netQty + '</div></div>'
+      + '</div>';
+
+    if (p.netQty !== 0) {
+      html += '<div class="rc-sub" style="margin-top:8px;text-align:center;">'
+        + (p.netQty > 0 ? 'Long' : 'Short') + ' ' + Math.abs(p.netQty) + ' contract' + (Math.abs(p.netQty) !== 1 ? 's' : '')
+        + ' @ avg \u20b9' + p.avgPrice.toFixed(2) + ' &middot; Lot ' + p.lot
+        + '</div>';
+    }
+
+    // Trade history (collapsed-style list)
+    html += '<div class="pos-trades">';
+    p.trades.forEach(function(t) {
+      html += '<div class="pos-trade-row">'
+        + '<span class="pos-trade-side ' + (t.side === 'BUY' ? 'buy' : 'sell') + '">' + t.side + '</span>'
+        + '<span class="pos-trade-detail">' + t.qty + ' @ \u20b9' + t.price + ' \u00B7 ' + (t.stratName || '') + '</span>'
+        + '<span class="pos-trade-date">' + (t.date || '') + '</span>'
+        + '</div>';
+    });
+    html += '</div>'; // pos-trades
+    html += '</div>'; // pos-card
+  });
+
+  html += '</div>';
+  wrap.innerHTML = html;
+}
+
 function renderPortfolio() {
   var el = document.getElementById('pfList');
   if (saved.length === 0) {
