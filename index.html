@@ -2569,13 +2569,69 @@ function loadPreset(name) {
 }
 
 // ─── Fetch Price ──────────────────────────────────────────────────────────────
+// ─── Fetch Price — races multiple sources/proxies in parallel, uses fastest ───
+// Single-proxy fetches are slow/unreliable (one dead proxy = total failure).
+// This fires several independent requests at once and uses whichever
+// responds first with a valid price, with a hard timeout on each.
+
+function xhrGetWithTimeout(url, timeoutMs, onSuccess, onFail) {
+  var xhr = new XMLHttpRequest();
+  var timedOut = false;
+  var timer = setTimeout(function(){
+    timedOut = true;
+    try { xhr.abort(); } catch(e){}
+    onFail('timeout');
+  }, timeoutMs);
+
+  xhr.open('GET', url, true);
+  xhr.onreadystatechange = function(){
+    if (xhr.readyState !== 4 || timedOut) return;
+    clearTimeout(timer);
+    if (xhr.status === 200 && xhr.responseText) {
+      onSuccess(xhr.responseText);
+    } else {
+      onFail('http-' + xhr.status);
+    }
+  };
+  xhr.onerror = function(){
+    if (timedOut) return;
+    clearTimeout(timer);
+    onFail('network-error');
+  };
+  try { xhr.send(); } catch(e) { clearTimeout(timer); onFail('send-error'); }
+}
+
+function extractYahooPrice(text) {
+  var data = JSON.parse(text);
+  // allorigins wraps the real payload in { contents: "..." }
+  var parsed = data.contents ? JSON.parse(data.contents) : data;
+  var meta = parsed && parsed.chart && parsed.chart.result && parsed.chart.result[0] && parsed.chart.result[0].meta;
+  var price = meta && (meta.regularMarketPrice || meta.previousClose);
+  return price || null;
+}
+
+function extractStooqPrice(text) {
+  // Stooq CSV format: Symbol,Date,Time,Open,High,Low,Close,Volume
+  var lines = text.trim().split('\n');
+  if (lines.length < 2) return null;
+  var cols = lines[1].split(',');
+  var close = parseFloat(cols[6]);
+  return (close && close > 0) ? close : null;
+}
+
 function fetchPrice() {
   var tickerEl = document.getElementById('tickerInput');
-  // If user left the field empty, use the currently selected symbol from the dropdown
   var ticker = (tickerEl.value.trim() || document.getElementById('symbolSel').value || '').toUpperCase();
   if (!ticker) { showToast('Enter a ticker symbol'); return; }
+
+  var fetchBtn = document.getElementById('fetchBtn');
+  if (fetchBtn && fetchBtn.disabled) return; // already fetching, ignore extra taps
+  var originalLabel = fetchBtn ? fetchBtn.textContent : 'Fetch';
+  if (fetchBtn) { fetchBtn.disabled = true; fetchBtn.textContent = '\u22EF'; fetchBtn.style.opacity = '0.7'; }
+
   showToast('Fetching\u2026');
-  // Auto-match lot size and sync dropdown from LOT_DB
+
+  // Auto-match lot size and sync dropdown from LOT_DB immediately (doesn't need network)
   if (LOT_DB[ticker]) {
     var monthIdx = parseInt(document.getElementById('lotMonthSel').value,10)||0;
     currentLot = LOT_DB[ticker].lots[monthIdx] || 1;
@@ -2583,31 +2639,74 @@ function fetchPrice() {
     var sel = document.getElementById('symbolSel');
     if (sel.querySelector('option[value="'+ticker+'"]')) sel.value = ticker;
   }
-  var sym = ticker.indexOf('.') >= 0 ? ticker : ticker+'.NS';
-  var url = 'https://query1.finance.yahoo.com/v8/finance/chart/'+sym+'?interval=1m&range=1d';
-  var xhr = new XMLHttpRequest();
-  xhr.open('GET', 'https://api.allorigins.win/get?url='+encodeURIComponent(url), true);
-  xhr.onreadystatechange = function(){
-    if (xhr.readyState !== 4) return;
-    if (xhr.status === 200) {
-      try {
-        var data   = JSON.parse(xhr.responseText);
-        var parsed = JSON.parse(data.contents);
-        var price  = parsed && parsed.chart && parsed.chart.result && parsed.chart.result[0]
-                   && parsed.chart.result[0].meta && parsed.chart.result[0].meta.regularMarketPrice;
-        if (price) {
-          document.getElementById('spotInput').value = price.toFixed(2);
-          showToast(ticker+': \u20b9'+price.toFixed(2)+' | Lot: '+currentLot);
-        } else {
-          showToast('Not found \u2013 enter manually');
+
+  function restoreButton() {
+    if (fetchBtn) { fetchBtn.disabled = false; fetchBtn.textContent = originalLabel; fetchBtn.style.opacity = '1'; }
+  }
+
+  var nseSym   = ticker.indexOf('.') >= 0 ? ticker.split('.')[0] : ticker;
+  var yahooSym = ticker.indexOf('.') >= 0 ? ticker : ticker + '.NS';
+  var yahooUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' + yahooSym + '?interval=1m&range=1d';
+  var stooqUrl = 'https://stooq.com/q/l/?s=' + nseSym.toLowerCase() + '.in&f=sd2t2ohlcv&h&e=csv';
+
+  // Race these sources in parallel — first valid price wins.
+  var sources = [
+    { name: 'Yahoo/allorigins',  url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(yahooUrl), extract: extractYahooPrice },
+    { name: 'Yahoo/corsproxy',   url: 'https://corsproxy.io/?' + encodeURIComponent(yahooUrl),               extract: extractYahooPrice },
+    { name: 'Yahoo/r.jina',      url: 'https://r.jina.ai/' + yahooUrl,                                       extract: extractYahooPrice },
+    { name: 'Stooq/allorigins',  url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(stooqUrl),  extract: extractStooqPrice },
+    { name: 'Yahoo/thingproxy',  url: 'https://thingproxy.freeboard.io/fetch/' + yahooUrl,                   extract: extractYahooPrice }
+  ];
+
+  var settled = false;
+  var failCount = 0;
+  var TIMEOUT_MS = 6000;
+
+  function handleSuccess(price, sourceName) {
+    if (settled) return;
+    settled = true;
+    restoreButton();
+    document.getElementById('spotInput').value = price.toFixed(2);
+    showToast(ticker + ': \u20b9' + price.toFixed(2) + ' | Lot: ' + currentLot);
+  }
+
+  function handleAllFailed() {
+    if (settled) return;
+    settled = true;
+    restoreButton();
+    showToast('All sources failed \u2013 enter price manually');
+  }
+
+  sources.forEach(function(src) {
+    xhrGetWithTimeout(
+      src.url,
+      TIMEOUT_MS,
+      function(responseText) {
+        if (settled) return;
+        try {
+          var price = src.extract(responseText);
+          if (price && price > 0) {
+            handleSuccess(price, src.name);
+          } else {
+            failCount++;
+            if (failCount >= sources.length) handleAllFailed();
+          }
+        } catch(e) {
+          failCount++;
+          if (failCount >= sources.length) handleAllFailed();
         }
-      } catch(e) { showToast('Parse error \u2013 enter manually'); }
-    } else {
-      showToast('Fetch failed \u2013 enter manually');
-    }
-  };
-  xhr.onerror = function(){ showToast('Network error \u2013 enter manually'); };
-  xhr.send();
+      },
+      function(reason) {
+        failCount++;
+        if (failCount >= sources.length) handleAllFailed();
+      }
+    );
+  });
+
+  // Absolute safety net — if something hangs despite per-request timeouts
+  setTimeout(function(){
+    if (!settled) { settled = true; restoreButton(); showToast('Timed out \u2013 enter price manually'); }
+  }, TIMEOUT_MS + 1500);
 }
 
 // ─── Export PDF ───────────────────────────────────────────────────────────────
