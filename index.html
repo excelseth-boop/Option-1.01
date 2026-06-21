@@ -665,8 +665,11 @@ label.lbl {
 
   <!-- ══ PORTFOLIO ══ -->
   <div class="tab" id="tabPortfolio">
-    <div class="sec-title">Open Positions (Net Holdings)</div>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:10px;">Tracks net long/short quantity per Symbol + Strike + Expiry + Type across all saved trades — like a brokerage position book.</p>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;">
+      <div class="sec-title" style="margin-bottom:0;">Open Positions (Net Holdings)</div>
+      <button class="btn-sec blue" id="refreshPosBookBtn" style="flex:0 0 auto;padding:5px 12px;font-size:12px;">&#8635; Refresh</button>
+    </div>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:10px;">Tracks net long/short quantity per Symbol + Strike + Expiry + Type across all saved trades — like a brokerage position book. Tap any trade row to remove it.</p>
     <div id="posBookWrap"></div>
     <div class="divider"></div>
 
@@ -1498,6 +1501,15 @@ function init() {
   // Autocomplete
   initAutocomplete();
 
+  // Portfolio: refresh position book button
+  var refreshBtn = document.getElementById('refreshPosBookBtn');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', function(){
+      renderPositionBook();
+      showToast('Position book refreshed');
+    });
+  }
+
   // Build UI pieces
   buildSymbolDropdown();
   buildPresets();
@@ -1984,9 +1996,57 @@ function drawChart(id, prices, payoffs, spot, bes) {
 function saveStrategy() {
   if (legs.length === 0) { showToast('Add legs first'); return; }
   collectLegs();
+
+  // ── Duplicate-save guard ─────────────────────────────────────────────────
+  // If the exact same builder (same symbol+lotMonth) was already saved and the
+  // current leg set is a superset of a previous save (i.e. user kept adding
+  // legs and tapping Save again), offer to REPLACE that earlier save instead
+  // of creating a second overlapping entry — this is what was silently
+  // double-counting trades in the Position Book.
+  var sym  = document.getElementById('symbolSel').value;
+  var curLotMonth = parseInt(document.getElementById('lotMonthSel').value,10)||0;
+  var legsSignature = JSON.stringify(legs.map(function(l){
+    return [l.type, l.strike, l.premium, l.qty, l.entryPrice];
+  }).sort());
+
+  var existingIdx = -1;
+  for (var i = 0; i < saved.length; i++) {
+    var s2 = saved[i];
+    if (s2.symbol !== sym || (s2.lotMonth||0) !== curLotMonth) continue;
+    var sig2 = JSON.stringify((s2.legs||[]).map(function(l){
+      return [l.type, l.strike, l.premium, l.qty, l.entryPrice];
+    }).sort());
+    // Exact same leg set already saved → this is a duplicate tap, not a new trade
+    if (sig2 === legsSignature) { existingIdx = i; break; }
+    // Current legs are a strict superset of a previous save (same leading legs,
+    // plus more added) → previous save was an intermediate snapshot, replace it
+    var prevLegs = (s2.legs||[]).map(function(l){ return [l.type,l.strike,l.premium,l.qty,l.entryPrice].join('~'); });
+    var curLegs  = legs.map(function(l){ return [l.type,l.strike,l.premium,l.qty,l.entryPrice].join('~'); });
+    var isSuperset = prevLegs.length < curLegs.length && prevLegs.every(function(pl){ return curLegs.indexOf(pl) >= 0; });
+    if (isSuperset) { existingIdx = i; break; }
+  }
+
+  if (existingIdx >= 0) {
+    var ok = confirm('This looks like an update to "' + saved[existingIdx].name + '" (same/overlapping legs already saved).\n\nTap OK to REPLACE it (recommended — avoids duplicate trades in Position Book), or Cancel to save as a brand new separate trade.');
+    if (ok) {
+      saved[existingIdx].legs     = JSON.parse(JSON.stringify(legs));
+      saved[existingIdx].spot     = parseFloat(document.getElementById('spotInput').value) || 0;
+      saved[existingIdx].lot      = currentLot;
+      saved[existingIdx].lotMonth = curLotMonth;
+      saved[existingIdx].date     = new Date().toLocaleDateString('en-IN');
+      var rn = document.getElementById('stratName').value.trim();
+      if (rn) saved[existingIdx].name = rn;
+      try { localStorage.setItem('sc3_strats', JSON.stringify(saved)); } catch(e){}
+      showToast('Updated: ' + saved[existingIdx].name);
+      renderSaved();
+      renderPositionBook();
+      return;
+    }
+    // else fall through and save as new
+  }
+
   // Smart default name: Symbol + leg summary + date (never generic "Strategy N")
   var rawName = document.getElementById('stratName').value.trim();
-  var sym = document.getElementById('symbolSel').value || document.getElementById('tickerInput').value || 'STK';
   if (!rawName) {
     var legSummary = legs.slice(0,2).map(function(l){
       var c=CFG[l.type];
@@ -1998,13 +2058,12 @@ function saveStrategy() {
     rawName = sym + ' ' + legSummary + ' ' + dd + mm;
   }
   var name = rawName;
-  var sym  = document.getElementById('symbolSel').value;
   var s = {
     id: Date.now(), name: name,
     ticker:  document.getElementById('tickerInput').value || '',
     symbol:  sym,
     lot:     currentLot,
-    lotMonth: parseInt(document.getElementById('lotMonthSel').value,10)||0,
+    lotMonth: curLotMonth,
     spot:    parseFloat(document.getElementById('spotInput').value) || 0,
     legs:    JSON.parse(JSON.stringify(legs)),
     dte:     document.getElementById('dteInput').value,
@@ -2148,7 +2207,8 @@ function computePositionBook() {
 
       entry.trades.push({
         side: isBuy ? 'BUY' : 'SELL',
-        qty: qty, price: price, date: tradeDate, stratName: strat.name
+        qty: qty, price: price, date: tradeDate, stratName: strat.name,
+        stratId: strat.id, legId: leg.id
       });
 
       if (isBuy) {
@@ -2236,13 +2296,13 @@ function renderPositionBook() {
         + '</div>';
     }
 
-    // Trade history (collapsed-style list)
+    // Trade history (collapsed-style list, tappable to remove individual trade)
     html += '<div class="pos-trades">';
     p.trades.forEach(function(t) {
-      html += '<div class="pos-trade-row">'
+      html += '<div class="pos-trade-row" data-stratid="' + t.stratId + '" data-legid="' + t.legId + '" style="cursor:pointer;">'
         + '<span class="pos-trade-side ' + (t.side === 'BUY' ? 'buy' : 'sell') + '">' + t.side + '</span>'
         + '<span class="pos-trade-detail">' + t.qty + ' @ \u20b9' + t.price + ' \u00B7 ' + (t.stratName || '') + '</span>'
-        + '<span class="pos-trade-date">' + (t.date || '') + '</span>'
+        + '<span class="pos-trade-date">' + (t.date || '') + ' &nbsp;\u2715</span>'
         + '</div>';
     });
     html += '</div>'; // pos-trades
@@ -2251,6 +2311,29 @@ function renderPositionBook() {
 
   html += '</div>';
   wrap.innerHTML = html;
+
+  // Wire tap-to-delete on each trade row
+  wrap.querySelectorAll('.pos-trade-row').forEach(function(row) {
+    row.addEventListener('click', function() {
+      var stratId = parseInt(row.getAttribute('data-stratid'), 10);
+      var legId   = parseInt(row.getAttribute('data-legid'), 10);
+      var strat = saved.filter(function(s){ return s.id === stratId; })[0];
+      if (!strat) return;
+      var leg = (strat.legs||[]).filter(function(l){ return l.id === legId; })[0];
+      var legDesc = leg ? (CFG[leg.type].label + (CFG[leg.type].hasK ? ' ' + leg.strike : '')) : 'this trade';
+      if (!confirm('Remove "' + legDesc + '" from "' + strat.name + '"?\\n\\nThis deletes just this one leg/trade, not the whole saved strategy.')) return;
+      strat.legs = (strat.legs||[]).filter(function(l){ return l.id !== legId; });
+      // If the strategy now has no legs left, remove the whole strategy entry
+      if (strat.legs.length === 0) {
+        saved = saved.filter(function(s){ return s.id !== stratId; });
+      }
+      try { localStorage.setItem('sc3_strats', JSON.stringify(saved)); } catch(e){}
+      showToast('Trade removed');
+      renderPositionBook();
+      renderSaved();
+      renderPortfolio();
+    });
+  });
 }
 
 function renderPortfolio() {
