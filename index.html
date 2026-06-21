@@ -2222,6 +2222,7 @@ function computePositionBook() {
   });
 
   // Compute net position + weighted average cost for the OPEN side
+  // + realized P&L for the CLOSED (matched) portion of the position
   var positions = Object.keys(bookMap).map(function(key) {
     var e = bookMap[key];
     var netQty = e.buyQty - e.sellQty; // >0 = net long, <0 = net short, 0 = flat/closed
@@ -2236,9 +2237,27 @@ function computePositionBook() {
       // Flat — show blended avg for reference
       avgPrice = (e.buyQty + e.sellQty) > 0 ? ((e.buyValue + e.sellValue) / (e.buyQty + e.sellQty)) : 0;
     }
+
+    // ── Realized P&L on the CLOSED (matched) portion ────────────────────────
+    // The matched quantity is min(buyQty, sellQty) — i.e. however many contracts
+    // were both bought AND sold get "closed out" and produce a definite cash P&L.
+    // avgBuyPrice  = e.buyValue  / e.buyQty   (average price paid per contract)
+    // avgSellPrice = e.sellValue / e.sellQty  (average price received per contract)
+    // Realized P&L = matchedQty * (avgSellPrice - avgBuyPrice) * lot
+    // (For pure-option premium trades this is the standard "round-trip" P&L:
+    //  you sold for more than you paid → profit; sold for less → loss.)
+    var matchedQty   = Math.min(e.buyQty, e.sellQty);
+    var avgBuyPrice  = e.buyQty  > 0 ? (e.buyValue  / e.buyQty)  : 0;
+    var avgSellPrice = e.sellQty > 0 ? (e.sellValue / e.sellQty) : 0;
+    var realizedPnL  = matchedQty * (avgSellPrice - avgBuyPrice) * e.lot;
+    var isFullyClosed = (netQty === 0 && matchedQty > 0);
+
     return {
       key: key, symbol: e.symbol, strike: e.strike, lotMonth: e.lotMonth, otype: e.otype, lot: e.lot,
-      buyQty: e.buyQty, sellQty: e.sellQty, netQty: netQty, avgPrice: avgPrice, trades: e.trades
+      buyQty: e.buyQty, sellQty: e.sellQty, netQty: netQty, avgPrice: avgPrice,
+      matchedQty: matchedQty, avgBuyPrice: avgBuyPrice, avgSellPrice: avgSellPrice,
+      realizedPnL: realizedPnL, isFullyClosed: isFullyClosed,
+      trades: e.trades
     };
   });
 
@@ -2268,7 +2287,26 @@ function renderPositionBook() {
   }
 
   var EXPIRY_LABELS = ['Jun 2026', 'Jul 2026', 'Aug 2026'];
-  var html = '<div class="posbook-wrap">';
+  var html = '';
+
+  // ── Total realized P&L across ALL positions (closed + partially closed) ──
+  var totalRealized = 0;
+  var closedCount = 0;
+  positions.forEach(function(p) {
+    totalRealized += p.realizedPnL;
+    if (p.isFullyClosed) closedCount++;
+  });
+  if (Math.abs(totalRealized) > 0.001 || closedCount > 0) {
+    var totColor = totalRealized >= 0 ? 'var(--green)' : 'var(--red)';
+    var totSign  = totalRealized >= 0 ? '+' : '\u2212';
+    html += '<div class="rc wide" style="margin-bottom:10px;padding:14px;text-align:center;">'
+      + '<div class="rc-lbl">Total Realized P&amp;L (All Closed Trades)</div>'
+      + '<div class="rc-val" style="font-size:24px;color:' + totColor + ';">' + totSign + '\u20b9' + Math.abs(totalRealized).toLocaleString('en-IN',{maximumFractionDigits:0}) + '</div>'
+      + '<div class="rc-sub">' + closedCount + ' fully closed position' + (closedCount !== 1 ? 's' : '') + '</div>'
+      + '</div>';
+  }
+
+  html += '<div class="posbook-wrap">';
 
   positions.forEach(function(p) {
     var statusClass = p.netQty > 0 ? 'long' : p.netQty < 0 ? 'short' : 'flat';
@@ -2294,6 +2332,26 @@ function renderPositionBook() {
         + (p.netQty > 0 ? 'Long' : 'Short') + ' ' + Math.abs(p.netQty) + ' contract' + (Math.abs(p.netQty) !== 1 ? 's' : '')
         + ' @ avg \u20b9' + p.avgPrice.toFixed(2) + ' &middot; Lot ' + p.lot
         + '</div>';
+    }
+
+    // ── Realized P&L on the matched/closed portion ──────────────────────────
+    if (p.matchedQty > 0) {
+      var pnlColor = p.realizedPnL >= 0 ? 'var(--green)' : 'var(--red)';
+      var pnlSign  = p.realizedPnL >= 0 ? '+' : '\u2212';
+      var pnlAbs   = '\u20b9' + Math.abs(p.realizedPnL).toLocaleString('en-IN', {maximumFractionDigits:0});
+      if (p.isFullyClosed) {
+        // Fully closed trade — show as the headline result for this card
+        html += '<div class="rc wide" style="margin-top:10px;padding:12px;text-align:center;background:var(--card2);">'
+          + '<div class="rc-lbl">Realized P&amp;L \u00B7 Trade Closed</div>'
+          + '<div class="rc-val" style="font-size:22px;color:' + pnlColor + ';">' + pnlSign + pnlAbs + '</div>'
+          + '<div class="rc-sub">' + p.matchedQty + ' contract' + (p.matchedQty !== 1 ? 's' : '') + ' \u00B7 Bought avg \u20b9' + p.avgBuyPrice.toFixed(2) + ' \u2192 Sold avg \u20b9' + p.avgSellPrice.toFixed(2) + ' \u00B7 Lot ' + p.lot + '</div>'
+          + '</div>';
+      } else {
+        // Partially closed — open position remains, but show realized P&L on the closed part too
+        html += '<div class="rc-sub" style="margin-top:4px;text-align:center;color:' + pnlColor + ';">'
+          + 'Realized on ' + p.matchedQty + ' closed contract' + (p.matchedQty !== 1 ? 's' : '') + ': ' + pnlSign + pnlAbs
+          + '</div>';
+      }
     }
 
     // Trade history (collapsed-style list, tappable to remove individual trade)
